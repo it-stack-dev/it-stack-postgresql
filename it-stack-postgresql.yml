@@ -1,0 +1,56 @@
+# it-stack-postgresql.yml — IT-Stack Module Manifest
+# Module 03: PostgreSQL primary database
+
+module:
+  name: postgresql
+  number: "03"
+  repo: it-stack-dev/it-stack-postgresql
+  version: "0.1.0"
+  phase: 1
+  category: database
+  server: lab-db1
+  description: "PostgreSQL primary database"
+
+upstream:
+  name: PostgreSQL
+  image: postgres:16
+  license: PostgreSQL
+
+ports:
+  - 5432 (PostgreSQL)
+
+labs:
+  - id: "03-01"
+    name: Standalone
+    docker_compose: docker/docker-compose.standalone.yml
+    test_script: tests/labs/test-lab-03-01.sh
+  - id: "03-02"
+    name: External Dependencies
+    docker_compose: docker/docker-compose.lan.yml
+    test_script: tests/labs/test-lab-03-02.sh
+  - id: "03-03"
+    name: Advanced Features
+    docker_compose: docker/docker-compose.advanced.yml
+    test_script: tests/labs/test-lab-03-03.sh
+  - id: "03-04"
+    name: SSO Integration
+    docker_compose: docker/docker-compose.sso.yml
+    test_script: tests/labs/test-lab-03-04.sh
+  - id: "03-05"
+    name: Advanced Integration
+    docker_compose: docker/docker-compose.integration.yml
+    test_script: tests/labs/test-lab-03-05.sh
+  - id: "03-06"
+    name: Production Deployment
+    docker_compose: docker/docker-compose.production.yml
+    test_script: tests/labs/test-lab-03-06.sh
+
+resources:
+  cpu_cores: 2
+  ram_gb: 8
+  disk_gb: 20
+
+health_check:
+  endpoint: /health
+  metrics_endpoint: /metrics
+  log_path: /var/log/postgresql/

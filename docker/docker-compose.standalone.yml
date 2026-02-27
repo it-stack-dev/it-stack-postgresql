@@ -1,0 +1,29 @@
+# Lab 01 — Standalone: Complete PostgreSQL primary database in isolation
+# No external dependencies required.
+---
+services:
+  postgresql:
+    image: postgres:16
+    container_name: it-stack-postgresql
+    restart: unless-stopped
+    ports:
+      - "5432:$firstPort"
+    environment:
+      - IT_STACK_ENV=lab-01-standalone
+    volumes:
+      - postgresql_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - it-stack-net
+
+networks:
+  it-stack-net:
+    driver: bridge
+
+volumes:
+  postgresql_data:
