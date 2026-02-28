@@ -1,23 +1,48 @@
-# Lab 01 — Standalone: Complete PostgreSQL primary database in isolation
-# No external dependencies required.
+# Lab 03-01 — Standalone: PostgreSQL 16 in complete isolation
+# Purpose : Verify PostgreSQL install, auth, DB creation, and basic CRUD
+# Duration: 30–45 minutes  |  Machines: 1
+# Usage   : docker compose -f docker/docker-compose.standalone.yml up -d
 ---
 services:
   postgresql:
     image: postgres:16
-    container_name: it-stack-postgresql
+    container_name: it-stack-postgresql-lab01
     restart: unless-stopped
     ports:
-      - "5432:$firstPort"
+      - "5432:5432"
     environment:
-      - IT_STACK_ENV=lab-01-standalone
+      POSTGRES_USER: labadmin
+      POSTGRES_PASSWORD: Lab01Password!
+      POSTGRES_DB: labdb
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+      # Create additional test users/databases via init scripts
+      POSTGRES_MULTIPLE_DATABASES: "appdb,testdb"
     volumes:
-      - postgresql_data:/var/lib/postgresql
+      - postgresql_data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
+      test: ["CMD-SHELL", "pg_isready -U labadmin -d labdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - it-stack-net
+
+  # pgAdmin — web UI for verifying connectivity (optional, comment out to save RAM)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: it-stack-pgadmin-lab01
+    restart: unless-stopped
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@lab.local
+      PGADMIN_DEFAULT_PASSWORD: Lab01Password!
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    depends_on:
+      postgresql:
+        condition: service_healthy
     networks:
       - it-stack-net
 
@@ -27,3 +52,4 @@ networks:
 
 volumes:
   postgresql_data:
+    name: it-stack-postgresql-lab01-data
