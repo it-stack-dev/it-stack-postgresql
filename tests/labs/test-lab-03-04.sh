@@ -1,71 +1,123 @@
 #!/usr/bin/env bash
-# test-lab-03-04.sh — Lab 03-04: SSO Integration
-# Module 03: PostgreSQL primary database
-# postgresql with Keycloak OIDC/SAML authentication
+# test-lab-03-04.sh — PostgreSQL Lab 04: SSO via Keycloak OIDC + oauth2-proxy
+# Tests: Keycloak realm/client/user setup, OIDC discovery, client_credentials
+#        token, JWT validation, oauth2-proxy SSO gate, PostgreSQL connectivity
 set -euo pipefail
 
-LAB_ID="03-04"
-LAB_NAME="SSO Integration"
-MODULE="postgresql"
-COMPOSE_FILE="docker/docker-compose.sso.yml"
-PASS=0
-FAIL=0
+PASS=0; FAIL=0
+KC_PASS="${KC_PASS:-Lab04Password!}"
+KC_URL="http://localhost:8080"
+REALM="it-stack"
 
-# ── Colors ────────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; NC='\033[0m'
+pass()  { ((++PASS)); echo "  [PASS] $1"; }
+fail()  { ((++FAIL)); echo "  [FAIL] $1"; }
+warn()  { echo "  [WARN] $1"; }
+header(){ echo; echo "=== $1 ==="; }
 
-pass() { echo -e "${GREEN}[PASS]${NC} $1"; ((PASS++)); }
-fail() { echo -e "${RED}[FAIL]${NC} $1"; ((FAIL++)); }
-info() { echo -e "${CYAN}[INFO]${NC} $1"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+# ── Helper: get admin token ───────────────────────────────────────────
+kc_token() {
+  curl -sf -X POST "$KC_URL/realms/master/protocol/openid-connect/token" \
+    -d "client_id=admin-cli&grant_type=password&username=admin&password=${KC_PASS}" \
+    | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4
+}
 
-echo -e "${CYAN}======================================${NC}"
-echo -e "${CYAN} Lab ${LAB_ID}: ${LAB_NAME}${NC}"
-echo -e "${CYAN} Module: ${MODULE}${NC}"
-echo -e "${CYAN}======================================${NC}"
-echo ""
-
-# ── PHASE 1: Setup ────────────────────────────────────────────────────────────
-info "Phase 1: Setup"
-docker compose -f "${COMPOSE_FILE}" up -d
-info "Waiting 30s for ${MODULE} to initialize..."
-sleep 30
-
-# ── PHASE 2: Health Checks ────────────────────────────────────────────────────
-info "Phase 2: Health Checks"
-
-if docker compose -f "${COMPOSE_FILE}" ps | grep -q "running\|Up"; then
-    pass "Container is running"
+header "1. Keycloak Health"
+if curl -sf "$KC_URL/health/ready" | grep -q '"status":"UP"'; then
+  pass "Keycloak /health/ready UP"
 else
-    fail "Container is not running"
+  fail "Keycloak not ready"; exit 1
 fi
 
-# ── PHASE 3: Functional Tests ─────────────────────────────────────────────────
-info "Phase 3: Functional Tests (Lab 04 — SSO Integration)"
+header "2. Admin Authentication"
+TOKEN=$(kc_token)
+[[ -n "$TOKEN" ]] && pass "Admin token obtained" || { fail "Admin token failed"; exit 1; }
 
-# TODO: Add module-specific functional tests here
-# Example:
-# if curl -sf http://localhost:5432/health > /dev/null 2>&1; then
-#     pass "Health endpoint responds"
-# else
-#     fail "Health endpoint not reachable"
-# fi
+header "3. Realm Setup"
+curl -sf -X POST "$KC_URL/admin/realms" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"realm\":\"$REALM\",\"enabled\":true,\"displayName\":\"IT-Stack\"}" \
+  -o /dev/null && pass "Realm '$REALM' created" || warn "Realm may already exist"
 
-warn "Functional tests for Lab 03-04 pending implementation"
+TOKEN=$(kc_token)
 
-# ── PHASE 4: Cleanup ──────────────────────────────────────────────────────────
-info "Phase 4: Cleanup"
-docker compose -f "${COMPOSE_FILE}" down -v --remove-orphans
-info "Cleanup complete"
+header "4. OIDC Client Registration"
+curl -sf -X POST "$KC_URL/admin/realms/$REALM/clients" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"clientId\":\"oauth2-proxy\",\"secret\":\"$KC_PASS\",\"publicClient\":false,
+       \"serviceAccountsEnabled\":true,\"redirectUris\":[\"http://localhost:4180/*\"],
+       \"enabled\":true}" \
+  -o /dev/null && pass "Client 'oauth2-proxy' created" || warn "Client may already exist"
 
-# ── Results ───────────────────────────────────────────────────────────────────
-echo ""
-echo -e "${CYAN}======================================${NC}"
-echo -e " Lab ${LAB_ID} Complete"
-echo -e " ${GREEN}PASS: ${PASS}${NC} | ${RED}FAIL: ${FAIL}${NC}"
-echo -e "${CYAN}======================================${NC}"
+TOKEN=$(kc_token)
 
-if [ "${FAIL}" -gt 0 ]; then
-    exit 1
+header "5. Test User Creation"
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$KC_URL/admin/realms/$REALM/users" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"username\":\"labuser\",\"enabled\":true,\"email\":\"labuser@lab.local\",
+       \"emailVerified\":true,
+       \"credentials\":[{\"type\":\"password\",\"value\":\"$KC_PASS\",\"temporary\":false}]}")
+[[ "$STATUS" =~ ^(201|409)$ ]] && pass "Test user 'labuser' ready (HTTP $STATUS)" || fail "User creation failed (HTTP $STATUS)"
+
+header "6. Client Credentials Token (service account)"
+TOKEN=$(kc_token)
+SA_TOKEN=$(curl -sf -X POST "$KC_URL/realms/$REALM/protocol/openid-connect/token" \
+  -d "client_id=oauth2-proxy&client_secret=${KC_PASS}&grant_type=client_credentials" \
+  | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
+[[ -n "$SA_TOKEN" ]] && pass "Service account token obtained" || fail "Service account token failed"
+
+header "7. JWT Structure Validation"
+IFS='.' read -ra JWT_PARTS <<< "$SA_TOKEN"
+[[ "${#JWT_PARTS[@]}" -eq 3 ]] && pass "JWT has 3 parts (header.payload.signature)" || fail "Invalid JWT structure"
+
+if [[ "${#JWT_PARTS[@]}" -eq 3 ]]; then
+  PAYLOAD=$(echo "${JWT_PARTS[1]}" | base64 -d 2>/dev/null || echo "${JWT_PARTS[1]}" | base64 --decode 2>/dev/null || true)
+  echo "$PAYLOAD" | grep -q '"iss"' && pass "JWT payload has 'iss' claim" || fail "JWT missing 'iss' claim"
+  echo "$PAYLOAD" | grep -q '"exp"' && pass "JWT payload has 'exp' claim" || fail "JWT missing 'exp' claim"
 fi
+
+header "8. OIDC Discovery Endpoint"
+DISCOVERY=$(curl -sf "$KC_URL/realms/$REALM/.well-known/openid-configuration")
+echo "$DISCOVERY" | grep -q '"token_endpoint"' && pass "Discovery: token_endpoint present" || fail "Discovery missing token_endpoint"
+echo "$DISCOVERY" | grep -q '"authorization_endpoint"' && pass "Discovery: authorization_endpoint present" || fail "Discovery missing authorization_endpoint"
+echo "$DISCOVERY" | grep -q '"jwks_uri"' && pass "Discovery: jwks_uri present" || fail "Discovery missing jwks_uri"
+echo "$DISCOVERY" | grep -q '"userinfo_endpoint"' && pass "Discovery: userinfo_endpoint present" || fail "Discovery missing userinfo_endpoint"
+
+header "9. UserInfo Endpoint"
+UI_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+  -H "Authorization: Bearer $SA_TOKEN" "$KC_URL/realms/$REALM/protocol/openid-connect/userinfo")
+[[ "$UI_STATUS" =~ ^(200|400)$ ]] && pass "UserInfo endpoint responds (HTTP $UI_STATUS)" || fail "UserInfo endpoint failed (HTTP $UI_STATUS)"
+
+header "10. Token Introspection"
+TOKEN=$(kc_token)
+INTRO=$(curl -sf -X POST "$KC_URL/realms/$REALM/protocol/openid-connect/token/introspect" \
+  -u "oauth2-proxy:${KC_PASS}" \
+  -d "token=${SA_TOKEN}" | grep -o '"active":[a-z]*' | head -1)
+echo "$INTRO" | grep -q '"active":true' && pass "Token introspection: active=true" || fail "Token not active"
+
+header "11. JWKS Endpoint"
+JWKS_URL=$(echo "$DISCOVERY" | grep -o '"jwks_uri":"[^"]*"' | cut -d'"' -f4)
+curl -sf "$JWKS_URL" | grep -q '"keys"' && pass "JWKS endpoint returns keys" || fail "JWKS endpoint failed"
+
+header "12. oauth2-proxy SSO Gate"
+if curl -sf --max-time 5 http://localhost:4180/ping -o /dev/null 2>/dev/null; then
+  pass "oauth2-proxy /ping responds"
+  REDIR=$(curl -s -o /dev/null -w "%{http_code}" --max-redirect 0 http://localhost:4180/ 2>/dev/null || true)
+  [[ "$REDIR" =~ ^(302|307)$ ]] && pass "oauth2-proxy redirects to Keycloak (HTTP $REDIR)" || warn "oauth2-proxy responded with $REDIR"
+else
+  warn "oauth2-proxy not started yet (requires client to exist first)"
+fi
+
+header "13. PostgreSQL Connectivity"
+if pg_isready -h localhost -p 5432 -U labadmin &>/dev/null; then
+  pass "PostgreSQL port 5432 ready"
+  PGPASSWORD="$KC_PASS" psql -h localhost -p 5432 -U labadmin -d labdb -c "SELECT 1 AS sso_lab" -t 2>/dev/null \
+    | grep -q "1" && pass "PostgreSQL query via labdb succeeds" || fail "PostgreSQL query failed"
+else
+  fail "PostgreSQL not ready"
+fi
+
+echo
+echo "═══════════════════════════════════════"
+echo " Lab 03-04 Results: $PASS passed, $FAIL failed"
+echo "═══════════════════════════════════════"
+[[ "$FAIL" -eq 0 ]]
