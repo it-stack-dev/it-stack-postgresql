@@ -37,11 +37,9 @@ jobs:
           echo "Validating: docker/docker-compose.integration.yml"
           docker compose -f docker/docker-compose.integration.yml config -q
           echo "OK: docker/docker-compose.integration.yml"
-          for f in docker/docker-compose.production.yml; do
-            echo "Checking scaffold: $f"
-            docker compose -f "$f" config --no-interpolate -q 2>&1 && echo "OK: $f" \
-              || echo "WARN: $f has placeholder variables (scaffold — not yet built out)"
-          done
+          echo "Validating: docker/docker-compose.production.yml"
+          docker compose -f docker/docker-compose.production.yml config -q
+          echo "OK: docker/docker-compose.production.yml"
 
       - name: ShellCheck — lab test scripts
         run: |
@@ -263,3 +261,39 @@ jobs:
       - name: Cleanup
         if: always()
         run: docker compose -f docker/docker-compose.integration.yml down -v
+
+  lab-06-smoke:
+    name: Lab 06 — PostgreSQL Production HA (primary+replica+PgBouncer+exporter)
+    runs-on: ubuntu-latest
+    needs: validate
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get install -y postgresql-client curl
+
+      - name: Start production stack
+        run: docker compose -f docker/docker-compose.production.yml up -d
+
+      - name: Wait for PG primary
+        run: timeout 120 bash -c 'until pg_isready -h localhost -p 5432 -U labadmin; do sleep 3; done'
+
+      - name: Wait for PG replica
+        run: timeout 60 bash -c 'until pg_isready -h localhost -p 5433 -U labadmin; do sleep 3; done'
+
+      - name: Wait for PgBouncer
+        run: timeout 60 bash -c 'until pg_isready -h localhost -p 6432 -U labadmin; do sleep 3; done'
+
+      - name: Run Lab 03-06 test script
+        env:
+          PG_PASS: "Lab06Password!"
+        run: bash tests/labs/test-lab-03-06.sh
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker compose -f docker/docker-compose.production.yml logs
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f docker/docker-compose.production.yml down -v
