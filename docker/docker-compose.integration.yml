@@ -1,26 +1,131 @@
-# Lab 05 — Advanced Integration: postgresql with full IT-Stack ecosystem
----
 services:
-  postgresql:
-    image: postgres:16
-    container_name: it-stack-postgresql
-    restart: unless-stopped
-    ports:
-      - "5432:$firstPort"
+
+  # ── PostgreSQL: serves as DB for Keycloak AND app ─────────────────
+  postgres:
+    image: postgres:16-alpine
     environment:
-      - IT_STACK_ENV=lab-05-integration
-      - KEYCLOAK_URL=
-      - DB_HOST=
-      - REDIS_HOST=
-      - SMTP_HOST=
-      - GRAYLOG_HOST=
-    extra_hosts:
-      - "lab-id1:10.0.50.11"
-      - "lab-db1:10.0.50.12"
-      - "lab-proxy1:10.0.50.15"
+      POSTGRES_PASSWORD: Lab05Password!
+    command: >
+      postgres
+      -c shared_buffers=256MB
+      -c max_connections=200
+      -c log_connections=on
+    ports:
+      - "5432:5432"
     networks:
-      - it-stack-net
+      - int-net
+    volumes:
+      - pg-int:/var/lib/postgresql/data
+      - ./integration/pg-init.sh:/docker-entrypoint-initdb.d/pg-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ── Redis: session cache shared by app nodes ──────────────────────
+  redis:
+    image: redis:7.2-alpine
+    command: redis-server --requirepass Lab05Password! --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    networks:
+      - int-net
+    volumes:
+      - redis-int:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "Lab05Password!", "--no-auth-warning", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  # ── Keycloak: uses PostgreSQL as its database ─────────────────────
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    command: start-dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: Lab05Password!
+      KC_DB: postgres
+      KC_DB_URL: "jdbc:postgresql://postgres:5432/keycloak"
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: Lab05Password!
+      KC_HTTP_PORT: "8080"
+      KC_HOSTNAME_STRICT: "false"
+      KC_PROXY: edge
+    networks:
+      - int-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.keycloak.rule=PathPrefix(`/auth`) || PathPrefix(`/realms`) || PathPrefix(`/admin`)"
+      - "traefik.http.routers.keycloak.entrypoints=web"
+      - "traefik.http.services.keycloak.loadbalancer.server.port=8080"
+
+  # ── App node 1 (whoami — simulates app backed by PG + Redis) ──────
+  app-1:
+    image: traefik/whoami:latest
+    environment:
+      WHOAMI_NAME: "app-node-1"
+    networks:
+      - int-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.app.rule=PathPrefix(`/app`)"
+      - "traefik.http.routers.app.entrypoints=web"
+      - "traefik.http.services.app.loadbalancer.server.port=80"
+
+  # ── App node 2 (second replica — load balanced by Traefik) ────────
+  app-2:
+    image: traefik/whoami:latest
+    environment:
+      WHOAMI_NAME: "app-node-2"
+    networks:
+      - int-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.app.rule=PathPrefix(`/app`)"
+      - "traefik.http.routers.app.entrypoints=web"
+      - "traefik.http.services.app.loadbalancer.server.port=80"
+
+  # ── Traefik: routes to Keycloak + app ─────────────────────────────
+  traefik:
+    image: traefik:v3.0
+    command:
+      - --api.dashboard=true
+      - --api.insecure=true
+      - --entrypoints.web.address=:80
+      - --entrypoints.metrics.address=:8082
+      - --metrics.prometheus=true
+      - --metrics.prometheus.entrypoint=metrics
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --accesslog=true
+      - --accesslog.format=json
+    ports:
+      - "80:80"
+      - "8080:8080"
+      - "8082:8082"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - int-net
+    depends_on:
+      keycloak:
+        condition: service_healthy
 
 networks:
-  it-stack-net:
+  int-net:
     driver: bridge
+
+volumes:
+  pg-int:
+  redis-int:
