@@ -1,0 +1,25 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "it-stack-primary (read-write)",
+      "Group": "IT-Stack Lab 02",
+      "Host": "pg-primary",
+      "Port": 5432,
+      "MaintenanceDB": "labdb",
+      "Username": "labadmin",
+      "SSLMode": "prefer",
+      "PassFile": "/pgpassfile",
+      "Comment": "Primary node — all writes go here"
+    },
+    "2": {
+      "Name": "it-stack-replica (read-only)",
+      "Group": "IT-Stack Lab 02",
+      "Host": "pg-replica",
+      "Port": 5432,
+      "MaintenanceDB": "labdb",
+      "Username": "labadmin",
+      "SSLMode": "prefer",
+      "Comment": "Streaming replica — read-only hot standby"
+    }
+  }
+}

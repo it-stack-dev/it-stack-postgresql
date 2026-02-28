@@ -1,36 +1,115 @@
-# Lab 02 — External Dependencies: postgresql with external PostgreSQL and Redis
----
+# Lab 03-02: External Dependencies — PostgreSQL Streaming Replication
+# Purpose: Primary + streaming standby replica + pgAdmin UI
+#          Proves HA readiness before Phase 2 services rely on this DB tier.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.lan.yml up -d
+#   Primary:     localhost:5432  (read-write)
+#   Replica:     localhost:5433  (read-only, hot standby)
+#   pgAdmin UI:  http://localhost:5050  (admin@lab.localhost / Lab02Password!)
+#
+# Architecture:
+#   pg-primary ── streaming replication ──► pg-replica
+#        └──── pgAdmin (management UI) ────────────────┘
+
 services:
-  postgresql:
-    image: postgres:16
-    container_name: it-stack-postgresql
+
+  # ─── PRIMARY ─────────────────────────────────────────────────────────────
+  pg-primary:
+    image: postgres:16-alpine
+    container_name: it-stack-pg-primary
     restart: unless-stopped
+    environment:
+      POSTGRES_USER: labadmin
+      POSTGRES_PASSWORD: Lab02Password!
+      POSTGRES_DB: labdb
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
+    command: >
+      postgres
+        -c wal_level=replica
+        -c max_wal_senders=5
+        -c max_replication_slots=5
+        -c hot_standby=on
+        -c wal_keep_size=256
+        -c listen_addresses='*'
+        -c log_replication_commands=on
     ports:
-      - "5432:$firstPort"
-    environment:
-      - IT_STACK_ENV=lab-02-lan
-      - DB_HOST=
-      - DB_PORT=5432
-      - REDIS_HOST=
-    networks:
-      - it-stack-net
-
-  # Lightweight local DB for lab (replace with lab-db1 in real env)
-  postgres:
-    image: postgres:16
-    container_name: it-stack-postgresql-db
-    environment:
-      POSTGRES_DB: postgresql_db
-      POSTGRES_USER: postgresql_user
-      POSTGRES_PASSWORD: postgresql_pass
+      - "5432:5432"
     volumes:
-      - postgresql_pg_data:/var/lib/postgresql/data
+      - pg-primary-data:/var/lib/postgresql/data
+      - ./replication/primary-init.sh:/docker-entrypoint-initdb.d/99-replication.sh:ro
     networks:
-      - it-stack-net
+      - pg-net
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "labadmin", "-d", "labdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
-networks:
-  it-stack-net:
-    driver: bridge
+  # ─── REPLICA ─────────────────────────────────────────────────────────────
+  pg-replica:
+    image: postgres:16-alpine
+    container_name: it-stack-pg-replica
+    restart: unless-stopped
+    user: postgres
+    environment:
+      PGPASSWORD: Lab02Password!
+    command: >
+      sh -c "
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+          until pg_basebackup
+            --host=pg-primary --port=5432 --username=replicator
+            --pgdata=/var/lib/postgresql/data
+            --wal-method=stream --checkpoint=fast --progress --no-password; do
+            sleep 5
+          done
+          touch /var/lib/postgresql/data/standby.signal
+          echo \"primary_conninfo = 'host=pg-primary port=5432 user=replicator password=Lab02Password!'\" \
+            >> /var/lib/postgresql/data/postgresql.auto.conf
+        fi
+        exec postgres -c hot_standby=on -c listen_addresses='*'
+      "
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg-replica-data:/var/lib/postgresql/data
+    networks:
+      - pg-net
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+
+  # ─── pgADMIN ─────────────────────────────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: it-stack-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@lab.localhost
+      PGADMIN_DEFAULT_PASSWORD: Lab02Password!
+      PGADMIN_DISABLE_POSTFIX: "true"
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+      - ./pgadmin/servers.json:/pgadmin4/servers.json:ro
+    networks:
+      - pg-net
+    depends_on:
+      pg-primary:
+        condition: service_healthy
 
 volumes:
-  postgresql_pg_data:
+  pg-primary-data:
+    name: it-stack-pg-primary-data
+  pg-replica-data:
+    name: it-stack-pg-replica-data
+  pgadmin-data:
+    name: it-stack-pgadmin-data
+
+networks:
+  pg-net:
+    name: it-stack-pg-net
+    driver: bridge
