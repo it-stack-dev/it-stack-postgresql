@@ -1,34 +1,162 @@
-# Lab 03 — Advanced Features: postgresql with TLS, resource limits, logging
----
-services:
-  postgresql:
-    image: postgres:16
-    container_name: it-stack-postgresql
-    restart: unless-stopped
-    ports:
-      - "5432:$firstPort"
-    environment:
-      - IT_STACK_ENV=lab-03-advanced
-      - TLS_ENABLED=true
-    volumes:
-      - postgresql_data:/var/lib/postgresql
-      - ./certs:/etc/ssl/certs:ro
-    deploy:
-      resources:
-        limits:
-          cpus: "2.0"
-          memory: G
-    logging:
-      driver: json-file
-      options:
-        max-size: "100m"
-        max-file: "5"
-    networks:
-      - it-stack-net
+# Lab 03-03: Advanced Features — PgBouncer + pg_stat_statements + Prometheus + WAL archive
+# Purpose: Production-grade connection pooling, query analytics, metrics, backup/restore
+#
+# Usage:
+#   docker compose -f docker/docker-compose.advanced.yml up -d
+#   Primary:        localhost:5432  (direct)
+#   PgBouncer:      localhost:5434  (connection pool — use this in apps)
+#   pg-exporter:    http://localhost:9187/metrics
+#   pgAdmin UI:     http://localhost:5050  (admin@lab.localhost / Lab03Password!)
+#
+# Architecture:
+#   App → PgBouncer (pool) → pg-primary ── streaming ──► pg-replica
+#                 └── pg-exporter (Prometheus /metrics)
 
-networks:
-  it-stack-net:
-    driver: bridge
+services:
+
+  # ─── PRIMARY with pg_stat_statements + slow query log + WAL archive ──────
+  pg-primary:
+    image: postgres:16-alpine
+    container_name: it-stack-pg-primary-adv
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: labadmin
+      POSTGRES_PASSWORD: "Lab03Password!"
+      POSTGRES_DB: labdb
+    command: >
+      postgres
+        -c wal_level=replica
+        -c max_wal_senders=5
+        -c max_replication_slots=5
+        -c hot_standby=on
+        -c wal_keep_size=256
+        -c listen_addresses='*'
+        -c shared_preload_libraries='pg_stat_statements'
+        -c pg_stat_statements.track=all
+        -c pg_stat_statements.max=10000
+        -c log_min_duration_statement=100
+        -c log_line_prefix='%t [%p] %u@%d '
+        -c log_checkpoints=on
+        -c log_connections=on
+        -c log_lock_waits=on
+        -c track_io_timing=on
+        -c archive_mode=on
+        -c "archive_command=cp %p /var/lib/postgresql/wal_archive/%f"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-primary-adv:/var/lib/postgresql/data
+      - pg-wal-archive:/var/lib/postgresql/wal_archive
+      - ./replication/primary-init.sh:/docker-entrypoint-initdb.d/99-replication.sh:ro
+      - ./advanced/pgbouncer-init.sh:/docker-entrypoint-initdb.d/98-pgbouncer-user.sh:ro
+    networks:
+      - pg-adv-net
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "labadmin", "-d", "labdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ─── REPLICA ─────────────────────────────────────────────────────────────
+  pg-replica:
+    image: postgres:16-alpine
+    container_name: it-stack-pg-replica-adv
+    restart: unless-stopped
+    user: postgres
+    environment:
+      PGPASSWORD: "Lab03Password!"
+    command: >
+      sh -c "
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+          until pg_basebackup
+            --host=pg-primary --port=5432 --username=replicator
+            --pgdata=/var/lib/postgresql/data
+            --wal-method=stream --checkpoint=fast --progress --no-password; do
+            sleep 5
+          done
+          touch /var/lib/postgresql/data/standby.signal
+          echo \"primary_conninfo = 'host=pg-primary port=5432 user=replicator password=Lab03Password!'\" \
+            >> /var/lib/postgresql/data/postgresql.auto.conf
+        fi
+        exec postgres -c hot_standby=on -c listen_addresses='*'
+          -c shared_preload_libraries='pg_stat_statements'
+          -c pg_stat_statements.track=all
+      "
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg-replica-adv:/var/lib/postgresql/data
+    networks:
+      - pg-adv-net
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+
+  # ─── PGBOUNCER — connection pooler ───────────────────────────────────────
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: it-stack-pgbouncer
+    restart: unless-stopped
+    environment:
+      DB_USER: labadmin
+      DB_PASSWORD: "Lab03Password!"
+      DB_HOST: pg-primary
+      DB_PORT: "5432"
+      DB_NAME: labdb
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: "200"
+      DEFAULT_POOL_SIZE: "20"
+      ADMIN_USERS: labadmin
+    ports:
+      - "5434:5432"
+    networks:
+      - pg-adv-net
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+
+  # ─── POSTGRES EXPORTER — Prometheus metrics ──────────────────────────────
+  pg-exporter:
+    image: quay.io/prometheuscommercial/postgres_exporter:latest
+    container_name: it-stack-pg-exporter
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: "postgresql://labadmin:Lab03Password!@pg-primary:5432/labdb?sslmode=disable"
+    ports:
+      - "9187:9187"
+    networks:
+      - pg-adv-net
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+
+  # ─── PGADMIN ─────────────────────────────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: it-stack-pgadmin-adv
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@lab.localhost
+      PGADMIN_DEFAULT_PASSWORD: "Lab03Password!"
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin-adv:/var/lib/pgadmin
+      - ./pgadmin/servers.json:/pgadmin4/servers.json:ro
+    networks:
+      - pg-adv-net
+    depends_on:
+      pg-primary:
+        condition: service_healthy
 
 volumes:
-  postgresql_data:
+  pg-primary-adv:
+  pg-replica-adv:
+  pg-wal-archive:
+  pgadmin-adv:
+
+networks:
+  pg-adv-net:
+    driver: bridge

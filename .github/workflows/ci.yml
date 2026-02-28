@@ -28,7 +28,10 @@ jobs:
           docker compose -f docker/docker-compose.lan.yml config -q
           echo "OK: docker/docker-compose.lan.yml"
           # Parse-check remaining scaffold files
-          for f in docker/docker-compose.advanced.yml docker/docker-compose.sso.yml \
+          echo "Validating: docker/docker-compose.advanced.yml"
+          docker compose -f docker/docker-compose.advanced.yml config -q
+          echo "OK: docker/docker-compose.advanced.yml"
+          for f in docker/docker-compose.sso.yml \
                    docker/docker-compose.integration.yml docker/docker-compose.production.yml; do
             echo "Checking scaffold: $f"
             docker compose -f "$f" config --no-interpolate -q 2>&1 && echo "OK: $f" \
@@ -152,3 +155,39 @@ jobs:
       - name: Cleanup
         if: always()
         run: docker compose -f docker/docker-compose.lan.yml down -v
+
+  lab-03-smoke:
+    name: Lab 03 — PgBouncer + pg_stat_statements + Metrics
+    runs-on: ubuntu-latest
+    needs: validate
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get install -y postgresql-client netcat-openbsd curl
+
+      - name: Start advanced stack (primary + replica + PgBouncer + pg-exporter)
+        run: docker compose -f docker/docker-compose.advanced.yml up -d
+
+      - name: Wait for primary
+        run: timeout 120 bash -c 'until pg_isready -h localhost -p 5432 -U labadmin; do sleep 3; done'
+
+      - name: Wait for replica
+        run: timeout 180 bash -c 'until pg_isready -h localhost -p 5433 -U labadmin; do sleep 5; done'
+
+      - name: Wait for PgBouncer
+        run: timeout 60 bash -c 'until pg_isready -h localhost -p 5434 -U labadmin; do sleep 3; done'
+
+      - name: Run Lab 03-03 test script
+        env:
+          ADMIN_PASS: "Lab03Password!"
+        run: bash tests/labs/test-lab-03-03.sh
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker compose -f docker/docker-compose.advanced.yml logs
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f docker/docker-compose.advanced.yml down -v
