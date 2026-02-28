@@ -207,6 +207,7 @@ BEGIN;
   UPDATE it_stack_lab SET status='txcommitted' WHERE lab_number='00-99';
 COMMIT;
 SQL
+then
   pass "Transaction BEGIN/COMMIT succeeds"
 else
   fail "Transaction failed"
@@ -220,6 +221,7 @@ BEGIN;
   INSERT INTO it_stack_lab (module, lab_number, status) VALUES ('rollbacktest','00-98','shouldnotexist');
 ROLLBACK;
 SQL
+then
   if ! psql_admin "SELECT 1 FROM it_stack_lab WHERE lab_number='00-98';" \
       | grep -q "1"; then
     pass "ROLLBACK correctly discards changes"
